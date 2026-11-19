@@ -2,12 +2,13 @@
 #
 # Stages the files the Pi needs before Linux starts onto the firmware partition
 # (default /boot/firmware): GPU boot code (bootcode.bin, start*.elf, fixup*.dat),
-# vendor device trees and overlays, the rendered config.txt, and optionally
-# U-Boot. Not a new boot method: boards still use
-# boot.loader.generic-extlinux-compatible (U-Boot reads extlinux.conf); this just
-# provides the files that path needs, either at SD-image build time
-# (sdImage.populateFirmwareCommands, wired automatically) or on a running system
-# (the opt-in activation script).
+# vendor device trees and overlays, the rendered config.txt, and either U-Boot
+# or the kernel itself. By default boards still use
+# boot.loader.generic-extlinux-compatible (U-Boot reads extlinux.conf). With
+# kernelBoot.enable the firmware loads the kernel, initrd and cmdline.txt
+# directly and there is no second-stage loader. The files are staged either at
+# SD-image build time (sdImage.populateFirmwareCommands, wired automatically) or
+# on a running system (the opt-in activation script).
 #
 # DTB/overlay copy adapted from nvmd/nixos-raspberrypi (MIT).
 
@@ -22,7 +23,8 @@
 let
   cfg = config.hardware.raspberry-pi.firmware;
 
-  # install-rpi-firmware <target-dir>
+  # install-rpi-firmware <target-dir> <system-toplevel>
+  # The toplevel is only read with kernelBoot.enable.
   # Idempotent: copies via temp file + rename, and prunes stale DTBs/overlays.
   mkInstallScript =
     scriptPkgs:
@@ -31,6 +33,7 @@ let
       runtimeInputs = [ scriptPkgs.coreutils ];
       text = ''
         target="$1"
+        toplevel="''${2:-}"
         shopt -s nullglob
 
         firmwareBoot=${cfg.package}/share/raspberrypi/boot
@@ -113,6 +116,20 @@ let
           copyForced ${cfg.uboot.package}/u-boot.bin "$target/u-boot.bin"
         ''}
 
+        ${lib.optionalString cfg.kernelBoot.enable ''
+          if [ -z "$toplevel" ]; then
+            echo "rpi-firmware: kernelBoot needs the system toplevel as second argument" >&2
+            exit 1
+          fi
+          echo "rpi-firmware: copying kernel, initrd and cmdline.txt from $toplevel"
+          copyForced "$toplevel/kernel" "$target/kernel.img"
+          copyForced "$toplevel/initrd" "$target/initrd"
+          # One line, as the firmware expects. The vendor DTB's /chosen/bootargs
+          # are merged in by the firmware ahead of these.
+          echo "$(cat "$toplevel/kernel-params") init=$(readlink -f "$toplevel")/init" > "$target/cmdline.txt.tmp"
+          mv "$target/cmdline.txt.tmp" "$target/cmdline.txt"
+        ''}
+
         echo "rpi-firmware: copying config.txt"
         copyForced ${config.hardware.raspberry-pi.configtxt.file} "$target/config.txt"
 
@@ -182,6 +199,21 @@ in
       };
     };
 
+    kernelBoot.enable = lib.mkEnableOption ''
+      booting Linux directly from the Raspberry Pi firmware, without U-Boot.
+
+      The kernel, initrd and a `cmdline.txt` for the system are copied to the
+      firmware partition and `config.txt` points the firmware at them. The
+      firmware hands its own device tree, with `config.txt` overlays applied,
+      straight to the kernel.
+
+      Only one system is installed, there is no boot menu and no rollback:
+      `generic-extlinux-compatible` is disabled and every install replaces the
+      previous kernel. Suited to images that are reflashed rather than
+      upgraded in place. Mutually exclusive with
+      {option}`hardware.raspberry-pi.firmware.uboot.enable`
+    '';
+
     useGenerationDeviceTree = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -209,16 +241,69 @@ in
       # U-Boot reloads bare dtbs and drops the overlays.
       boot.loader.generic-extlinux-compatible.useGenerationDeviceTree = lib.mkDefault false;
     })
+    (lib.mkIf cfg.kernelBoot.enable {
+      assertions = [
+        {
+          assertion = !cfg.uboot.enable;
+          message = "hardware.raspberry-pi.firmware.kernelBoot.enable and uboot.enable are mutually exclusive.";
+        }
+        {
+          assertion = !config.boot.loader.generic-extlinux-compatible.enable;
+          message = ''
+            hardware.raspberry-pi.firmware.kernelBoot.enable boots without U-Boot, so
+            boot.loader.generic-extlinux-compatible.enable must stay false.
+          '';
+        }
+      ];
+
+      hardware.raspberry-pi.configtxt = {
+        settings.all = {
+          kernel = lib.mkDefault "kernel.img";
+          # The firmware loads kernel= in 32-bit mode unless arm_64bit=1.
+          arm_64bit = lib.mkDefault pkgs.stdenv.hostPlatform.isAarch64;
+        };
+        # Not key=value syntax, so it can't go through settings.
+        extraConfig = ''
+          initramfs initrd followkernel
+        '';
+      };
+
+      # Overrides the board profiles' mkDefault. nixpkgs' sd-image-aarch64.nix
+      # sets it to true and runs the extlinux builder; build images from
+      # sd-image.nix instead.
+      boot.loader.generic-extlinux-compatible.enable = false;
+
+      # nixos-rebuild boot/switch: rewrite the kernel on the firmware partition.
+      system.build.installBootLoader = pkgs.writeShellScript "install-rpi-kernelboot" ''
+        if ! ${pkgs.util-linux}/bin/mountpoint -q ${lib.escapeShellArg cfg.path}; then
+          echo "rpi-firmware: ${cfg.path} is not mounted, cannot install the kernel" >&2
+          exit 1
+        fi
+        exec ${lib.getExe installScript} ${lib.escapeShellArg cfg.path} "$1"
+      '';
+      system.boot.loader.id = "raspberrypi-kernelboot";
+    })
     # Stage the firmware partition at SD-image build time, only when an
     # sd-image module is imported. mkForce so we override (not merge with)
     # sd-image-aarch64.nix, which also sets this and would clobber config.txt.
     (lib.optionalAttrs (options ? sdImage) {
-      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe imageInstallScript} ./firmware\n";
+      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe imageInstallScript} ./firmware ${config.system.build.toplevel}\n";
     })
+    # The root partition's /boot stays empty; there is no extlinux.conf. The
+    # kernel and initrd live on the firmware partition, so the 30 MiB default
+    # is too small.
+    (lib.optionalAttrs (options ? sdImage) (
+      lib.mkIf cfg.kernelBoot.enable {
+        sdImage.populateRootCommands = lib.mkForce ''
+          mkdir -p ./files/boot
+        '';
+        sdImage.firmwareSize = lib.mkDefault 256;
+      }
+    ))
     (lib.mkIf cfg.enable {
       system.activationScripts.raspberry-pi-firmware = lib.stringAfter [ "specialfs" ] ''
         if mountpoint -q ${lib.escapeShellArg cfg.path}; then
-          ${lib.getExe installScript} ${lib.escapeShellArg cfg.path}
+          ${lib.getExe installScript} ${lib.escapeShellArg cfg.path} "$systemConfig"
         else
           echo "rpi-firmware: ${cfg.path} is not a mounted partition, skipping firmware install" >&2
         fi

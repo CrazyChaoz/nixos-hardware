@@ -41,6 +41,22 @@ To chainload U-Boot from the firmware, enable `uboot.enable`. It copies `u-boot.
 
 `uboot.enable` defaults `uboot.package` to nixpkgs' `pkgs.ubootRaspberryPiAarch64`, built from the upstream `rpi_arm64_defconfig`, which covers every 64-bit board (Pi 3/4/5). For a 32-bit board, override `uboot.package` with the matching U-Boot build. On the Pi 5 this boots from SD, but U-Boot can't drive USB/PCIe/RP1 yet, so USB boot, NVMe boot, and a USB keyboard at the U-Boot prompt don't work until Linux takes over.
 
+### Direct kernel boot
+
+To skip U-Boot entirely, enable `kernelBoot.enable` instead of `uboot.enable`. The firmware then loads the kernel, initrd and `cmdline.txt` from the firmware partition and passes its own device tree, with the `config.txt` overlays applied, straight to the kernel:
+
+```nix
+{
+  hardware.raspberry-pi.firmware.kernelBoot.enable = true;
+}
+```
+
+This installs exactly one system: there is no boot menu, no generation list and no rollback, and `generic-extlinux-compatible` is turned off. It suits images that are reflashed rather than upgraded in place. `nixos-rebuild boot` still works when the firmware partition is mounted at `hardware.raspberry-pi.firmware.path`, but it overwrites the only kernel. For an SD image, import nixpkgs' `installer/sd-card/sd-image.nix`, not `sd-image-aarch64.nix`: the latter enables `generic-extlinux-compatible` and runs its builder for `/boot`. The root partition's `/boot` stays empty, and `sdImage.firmwareSize` defaults to 256 MiB to fit the kernel and initrd.
+
+The firmware merges the vendor DTB's `/chosen/bootargs` into the command line ahead of `cmdline.txt`. U-Boot used to replace those, so check `/proc/cmdline` when moving a system over.
+
+`config.txt` gets `kernel=kernel.img`, `arm_64bit=1` on aarch64, and an `initramfs initrd followkernel` line through `configtxt.extraConfig`, which holds directives that are not `key=value`.
+
 ## `config.txt`
 
 Board profiles import `hardware.raspberry-pi.configtxt`, which renders `config.txt` from Nix options. The defaults track the Raspberry Pi OS pi-gen image: camera and display autodetect, KMS, audio on, `arm_boost`.

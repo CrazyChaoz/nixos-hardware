@@ -176,7 +176,7 @@ let
     ];
 
   # Settings render first, so base DT parameters apply before any overlay loads.
-  # The overlay groups follow. A blank line separates the two sections, and the
+  # The overlay groups follow, then extraConfig under its own [all]. A blank line separates the two sections, and the
   # filter keeps that separator from becoming a stray leading or trailing line
   # when one of the two is empty.
   generatedConfig =
@@ -184,6 +184,7 @@ let
       [
         (render cfg.settings renderSettingsGroup recurseSettings)
         (render cfg.deviceTreeOverlays renderOverlayGroup recurseOverlays)
+        (lib.optionalString (cfg.extraConfig != "") (mkFilterHeader [ ] + cfg.extraConfig))
       ]
       [
         (lib.filter (section: section != ""))
@@ -328,14 +329,27 @@ in
       '';
     };
 
+    extraConfig = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = ''
+        Lines appended verbatim to the end of `config.txt`, after an `[all]`
+        filter. For directives that are not `key=value`, such as
+        `initramfs <file> <address>`. Do not put `dtparam` lines here; they
+        would apply to whichever overlay loaded last.
+      '';
+      example = "initramfs initrd followkernel";
+    };
+
     file = lib.mkOption {
       type = lib.types.path;
       default = pkgs.writeText "config.txt" generatedConfig;
       defaultText = lib.literalExpression ''pkgs.writeText "config.txt" (generated from settings and deviceTreeOverlays)'';
       description = ''
         Path to the config.txt file to install. Defaults to the rendered output
-        of {option}`settings` and {option}`deviceTreeOverlays`. A custom file
-        replaces that output, so the module then ignores both options.
+        of {option}`settings`, {option}`deviceTreeOverlays` and
+        {option}`extraConfig`. A custom file replaces that output, so the module
+        then ignores all three.
       '';
     };
   };
